@@ -6,6 +6,7 @@ from typing import Any
 from core.db import AccountModel, get_session
 from core.registry import get
 from core.base_platform import RegisterConfig
+from core.config_store import config_store
 
 router = APIRouter(prefix="/actions", tags=["actions"])
 
@@ -18,7 +19,7 @@ class ActionRequest(BaseModel):
 def list_actions(platform: str):
     """获取平台支持的操作列表"""
     PlatformCls = get(platform)
-    instance = PlatformCls(config=RegisterConfig())
+    instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
     return {"actions": instance.get_platform_actions()}
 
 
@@ -36,7 +37,7 @@ def execute_action(
         raise HTTPException(404, "账号不存在")
 
     PlatformCls = get(platform)
-    instance = PlatformCls(config=RegisterConfig())
+    instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
 
     from core.base_platform import Account, AccountStatus
     account = Account(
@@ -54,12 +55,15 @@ def execute_action(
         # 若操作返回了新 token，更新数据库
         if result.get("ok") and result.get("data", {}) and isinstance(result["data"], dict):
             data = result["data"]
-            if "access_token" in data:
+            tracked_keys = {"access_token", "accessToken", "refreshToken", "clientId", "clientSecret", "webAccessToken"}
+            if tracked_keys.intersection(data.keys()):
                 extra = acc_model.get_extra()
                 extra.update(data)
                 acc_model.set_extra(extra)
                 if data.get("access_token"):
                     acc_model.token = data["access_token"]
+                elif data.get("accessToken"):
+                    acc_model.token = data["accessToken"]
                 from datetime import datetime, timezone
                 acc_model.updated_at = datetime.now(timezone.utc)
                 session.add(acc_model)

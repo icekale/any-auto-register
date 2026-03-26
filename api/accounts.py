@@ -32,6 +32,10 @@ class ImportRequest(BaseModel):
     lines: list[str]
 
 
+class BatchDeleteRequest(BaseModel):
+    ids: list[int]
+
+
 @router.get("")
 def list_accounts(
     platform: Optional[str] = None,
@@ -136,6 +140,44 @@ def import_accounts(
         created += 1
     session.commit()
     return {"created": created}
+
+
+@router.post("/batch-delete")
+def batch_delete_accounts(
+    body: BatchDeleteRequest,
+    session: Session = Depends(get_session)
+):
+    """批量删除账号"""
+    if not body.ids:
+        raise HTTPException(400, "账号 ID 列表不能为空")
+    
+    if len(body.ids) > 1000:
+        raise HTTPException(400, "单次最多删除 1000 个账号")
+    
+    deleted_count = 0
+    not_found_ids = []
+    
+    try:
+        for account_id in body.ids:
+            acc = session.get(AccountModel, account_id)
+            if acc:
+                session.delete(acc)
+                deleted_count += 1
+            else:
+                not_found_ids.append(account_id)
+        
+        session.commit()
+        logger.info(f"批量删除成功: {deleted_count} 个账号")
+        
+        return {
+            "deleted": deleted_count,
+            "not_found": not_found_ids,
+            "total_requested": len(body.ids)
+        }
+    except Exception as e:
+        session.rollback()
+        logger.exception("批量删除失败")
+        raise HTTPException(500, f"批量删除失败: {str(e)}")
 
 
 @router.post("/check-all")

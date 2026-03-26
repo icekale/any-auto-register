@@ -1,6 +1,7 @@
 """邮箱池基类 - 抽象临时邮箱/收件服务"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional, Any
 
 
 @dataclass
@@ -22,6 +23,56 @@ class BaseMailbox(ABC):
                       code_pattern: str = None, **kwargs) -> str:
         """等待并返回验证码，code_pattern 为自定义正则（默认匹配6位数字）"""
         ...
+
+    def _safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
+        """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
+        import re
+        text = str(text or "")
+        if not text:
+            return None
+
+        patterns = []
+        if pattern:
+            patterns.append(pattern)
+
+        # 先匹配带明显语义的验证码，避免误提取 MIME boundary、时间戳等 6 位数字。
+        patterns.extend([
+            r'(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})',
+            r'(?is)\bcode\b[^0-9]{0,12}(\d{6})',
+            r'(?<!#)(?<!\d)(\d{6})(?!\d)',
+        ])
+
+        for regex in patterns:
+            m = re.search(regex, text)
+            if m:
+                # 兼容逻辑：若 pattern 中有捕获组则取 group(1)，否则取 group(0)
+                return m.group(1) if m.groups() else m.group(0)
+        return None
+
+    def _decode_raw_content(self, raw: str) -> str:
+        """解析邮件原始文本 (借鉴自 Fugle)，处理 Quoted-Printable 和 HTML 实体"""
+        import quopri, html, re
+        text = str(raw or "")
+        if not text: return ""
+        # 简单切分 Header 和 Body
+        if "\r\n\r\n" in text:
+            text = text.split("\r\n\r\n", 1)[1]
+        elif "\n\n" in text:
+            text = text.split("\n\n", 1)[1]
+        try:
+            # 处理 Quoted-Printable
+            decoded_bytes = quopri.decodestring(text)
+            text = decoded_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        # 清除 HTML 标签并反转义
+        text = html.unescape(text)
+        text = re.sub(r'(?im)^content-(?:type|transfer-encoding):.*$', ' ', text)
+        text = re.sub(r'(?im)^--+[_=\w.-]+$', ' ', text)
+        text = re.sub(r'(?i)----=_part_[\w.]+', ' ', text)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
     @abstractmethod
     def get_current_ids(self, account: MailboxAccount) -> set:
@@ -130,9 +181,9 @@ class LaoudoMailbox(BaseMailbox):
                                 str(mail.get("content") or mail.get("html") or ""))
                         if keyword and keyword.lower() not in text.lower():
                             continue
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                        if m:
-                            return m.group(1)
+                        code = self._safe_extract(text, code_pattern)
+                        if code:
+                            return code
             except Exception:
                 pass
             time.sleep(4)
@@ -181,9 +232,9 @@ class AitreMailbox(BaseMailbox):
                         text = mail.get("preview", "") + mail.get("content", "")
                         if keyword and keyword.lower() not in text.lower():
                             continue
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                        if m:
-                            return m.group(1)
+                        code = self._safe_extract(text, code_pattern)
+                        if code:
+                            return code
             except Exception:
                 pass
             time.sleep(3)
@@ -244,9 +295,9 @@ class TempMailLolMailbox(BaseMailbox):
                     text = mail.get("subject", "") + " " + mail.get("body", "") + " " + mail.get("html", "")
                     if keyword and keyword.lower() not in text.lower():
                         continue
-                    m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                    if m:
-                        return m.group(1)
+                    code = self._safe_extract(text, code_pattern)
+                    if code:
+                        return code
             except Exception:
                 pass
             time.sleep(3)
@@ -331,8 +382,8 @@ class DuckMailMailbox(BaseMailbox):
                     except Exception:
                         body = str(msg.get("subject") or "")
                     body = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', body)
-                    m = re.search(r"(?<!#)(?<!\d)(\d{6})(?!\d)", body)
-                    if m: return m.group(1)
+                    code = self._safe_extract(body, code_pattern)
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)
@@ -407,20 +458,19 @@ class CFWorkerMailbox(BaseMailbox):
                         continue
                     seen.add(mid)
                     raw = str(mail.get("raw", ""))
-                    # 1. 优先匹配 <span>XXXXXX</span> （Trae 邮件格式）
-                    code_m = re.search(r'<span[^>]*>\s*(\d{6})\s*</span>', raw)
-                    if code_m:
-                        return code_m.group(1)
-                    # 2. 跳过 MIME header，只搜 body 部分，避免匹配时间戳
-                    body_start = raw.find('\r\n\r\n')
-                    search_text = raw[body_start:] if body_start != -1 else raw
+                    subject = str(mail.get("subject", ""))
+                    # 2. 深度解析 Body 内容
+                    search_text = f"{subject} {self._decode_raw_content(raw)}".strip()
+                    # 排除干扰 (Email/Timestamp)
                     search_text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', search_text)
-                    # 排除时间戳模式 m=+XXXXXX. 和 t=XXXXXXXXXX
                     search_text = re.sub(r'm=\+\d+\.\d+', '', search_text)
                     search_text = re.sub(r'\bt=\d+\b', '', search_text)
-                    m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', search_text)
-                    if m:
-                        return m.group(1)
+                    if keyword and keyword.lower() not in search_text.lower():
+                        continue
+
+                    code = self._safe_extract(search_text, code_pattern)
+                    if code:
+                        return code
             except Exception:
                 pass
             time.sleep(3)
@@ -520,11 +570,8 @@ class MoeMailMailbox(BaseMailbox):
                     seen.add(mid)
                     body = str(msg.get("content") or msg.get("text") or msg.get("body") or msg.get("html") or "") + " " + str(msg.get("subject") or "")
                     body = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', body)
-                    if pattern:
-                        m = pattern.search(body)
-                    else:
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', body)
-                    if m: return m.group(0) if code_pattern else m.group(1)
+                    code = self._safe_extract(body, code_pattern)
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)
@@ -600,8 +647,8 @@ class FreemailMailbox(BaseMailbox):
                         return code
                     # 兜底：从 preview 提取
                     text = str(msg.get("preview", "")) + " " + str(msg.get("subject", ""))
-                    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-                    if m: return m.group(1)
+                    code = self._safe_extract(text, code_pattern)
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)

@@ -35,19 +35,18 @@ class ChatGPTPlatform(BasePlatform):
 
         proxy = self.config.proxy if self.config else None
         log_fn = getattr(self, '_log_fn', print)
-        mail_provider = (self.config.extra or {}).get('mail_provider', 'tempmail_lol')
-
         from platforms.chatgpt.register_v2 import RegistrationEngineV2 as RegistrationEngine
         log_fn = getattr(self, '_log_fn', print)
 
-        if mail_provider == 'laoudo' and self.mailbox:
+        if self.mailbox:
+            # 通用 EmailService 适配器，支持所有 BaseMailbox 实现 (cfworker, duckmail, laoudo 等)
             mail_acct = self.mailbox.get_email()
             email = email or mail_acct.email
             _mailbox = self.mailbox
             _mail_acct = mail_acct
 
-            class LaoudoEmailService:
-                service_type = type('ST', (), {'value': 'laoudo'})()
+            class GenericEmailService:
+                service_type = type('ST', (), {'value': 'custom_provider'})()
                 def create_email(self, config=None):
                     return {'email': _mail_acct.email, 'service_id': _mail_acct.account_id, 'token': ''}
                 def get_verification_code(self, email=None, email_id=None, timeout=120, pattern=None, otp_sent_at=None):
@@ -57,11 +56,12 @@ class ChatGPTPlatform(BasePlatform):
                 def status(self): return None
 
             engine = RegistrationEngine(
-                email_service=LaoudoEmailService(),
+                email_service=GenericEmailService(),
                 proxy_url=proxy, callback_logger=log_fn)
             engine.email = email
             engine.password = password
         else:
+            # 兼容逻辑：若未传入 mailbox 则默认使用 tempmail_lol
             from core.base_mailbox import TempMailLolMailbox
             _tmail = TempMailLolMailbox(proxy=proxy)
 

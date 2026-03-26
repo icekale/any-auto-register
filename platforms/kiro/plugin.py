@@ -33,7 +33,13 @@ class KiroPlatform(BasePlatform):
             _before = self.mailbox.get_current_ids(mail_acct)
             def otp_cb():
                 log_fn("等待验证码...")
-                code = self.mailbox.wait_for_code(mail_acct, keyword="", timeout=otp_timeout, before_ids=_before)
+                code = self.mailbox.wait_for_code(
+                    mail_acct,
+                    keyword="builder id",
+                    timeout=otp_timeout,
+                    before_ids=_before,
+                    code_pattern=r'(?is)(?:verification\s+code|验证码)[^0-9]{0,20}(\d{6})',
+                )
                 if code: log_fn(f"验证码: {code}")
                 return code
         else:
@@ -63,6 +69,7 @@ class KiroPlatform(BasePlatform):
                 "clientId": info.get("clientId", ""),
                 "clientSecret": info.get("clientSecret", ""),
                 "refreshToken": info.get("refreshToken", ""),
+                "webAccessToken": info.get("webAccessToken", ""),
             },
         )
 
@@ -96,11 +103,86 @@ class KiroPlatform(BasePlatform):
             from platforms.kiro.switch import (
                 refresh_kiro_token, switch_kiro_account, restart_kiro_ide,
             )
+            from platforms.kiro.core import KiroRegister
+            from core.base_mailbox import create_mailbox, MailboxAccount
 
             access_token = extra.get("accessToken", "") or account.token
             refresh_token = extra.get("refreshToken", "")
             client_id = extra.get("clientId", "")
             client_secret = extra.get("clientSecret", "")
+
+            # Kiro 桌面端需要完整的 Builder ID SSO 缓存。
+            # 只有 accessToken/sessionToken 的网页态账号无法稳定切到桌面应用。
+            if not access_token:
+                return {"ok": False, "error": "当前账号缺少 accessToken，无法切换到桌面应用"}
+            if not refresh_token or not client_id or not client_secret:
+                if account.email and account.password:
+                    reg = KiroRegister(proxy=self.config.proxy, tag="KIRO-SWITCH")
+                    reg.log = getattr(self, "_log_fn", print)
+                    otp_callback = None
+                    mail_provider = self.config.extra.get("mail_provider", "")
+                    if mail_provider:
+                        try:
+                            mailbox = create_mailbox(
+                                provider=mail_provider,
+                                extra=self.config.extra,
+                                proxy=self.config.proxy,
+                            )
+                            mail_account = MailboxAccount(email=account.email, account_id="")
+                            before_ids = mailbox.get_current_ids(mail_account)
+
+                            def _otp_cb():
+                                reg.log("桌面授权等待邮箱验证码 ...")
+                                try:
+                                    code = mailbox.wait_for_code(
+                                        mail_account,
+                                        keyword="",
+                                        timeout=45,
+                                        before_ids=before_ids,
+                                        code_pattern=r'(?is)(?:verification\s+code|验证码)[^0-9]{0,20}(\d{6})',
+                                    )
+                                except Exception:
+                                    reg.log("未等到新验证码，回退读取最近一封身份验证邮件 ...")
+                                    code = mailbox.wait_for_code(
+                                        mail_account,
+                                        keyword="",
+                                        timeout=15,
+                                        before_ids=None,
+                                        code_pattern=r'(?is)(?:verification\s+code|验证码)[^0-9]{0,20}(\d{6})',
+                                    )
+                                if code:
+                                    reg.log(f"桌面授权验证码: {code}")
+                                return code
+
+                            otp_callback = _otp_cb
+                        except Exception:
+                            otp_callback = None
+
+                    ok, desktop_info = reg.fetch_desktop_tokens(
+                        account.email,
+                        account.password,
+                        otp_callback=otp_callback,
+                    )
+                    if not ok:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "当前账号缺少 refreshToken / clientId / clientSecret，"
+                                f"且自动补抓桌面端 Token 失败: {desktop_info.get('error', 'unknown error')}"
+                            ),
+                        }
+                    access_token = desktop_info.get("accessToken", "") or access_token
+                    refresh_token = desktop_info.get("refreshToken", "")
+                    client_id = desktop_info.get("clientId", "")
+                    client_secret = desktop_info.get("clientSecret", "")
+                else:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "当前账号只有网页登录态，缺少 refreshToken / clientId / clientSecret，"
+                            "并且没有可用的邮箱/密码用于自动补抓桌面端 Token。"
+                        ),
+                    }
 
             if refresh_token and client_id and client_secret:
                 ok, result = refresh_kiro_token(refresh_token, client_id, client_secret)
@@ -119,6 +201,10 @@ class KiroPlatform(BasePlatform):
 
             restart_ok, restart_msg = restart_kiro_ide()
             return {"ok": True, "data": {
+                "accessToken": access_token,
+                "refreshToken": refresh_token,
+                "clientId": client_id,
+                "clientSecret": client_secret,
                 "message": f"{msg}。{restart_msg}" if restart_ok else msg,
             }}
 

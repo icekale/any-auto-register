@@ -16,6 +16,7 @@ class GrokPlatform(BasePlatform):
 
     def register(self, email: str, password: str = None) -> Account:
         from platforms.grok.core import GrokRegister
+        from core.config_store import config_store
         log = getattr(self, '_log_fn', print)
 
         mail_acct = self.mailbox.get_email() if self.mailbox else None
@@ -27,10 +28,14 @@ class GrokPlatform(BasePlatform):
             log("等待验证码...")
             code = self.mailbox.wait_for_code(mail_acct, keyword="", before_ids=before_ids,
                                               code_pattern=r'[A-Z0-9]{3}-[A-Z0-9]{3}')
-            if code: log(f"验证码: {code}")
+            if code:
+                # 清洗验证码：移除连字符和空格 (API 通常期望纯字符)
+                code = code.replace('-', '').replace(' ', '')
+                log(f"验证码: {code}")
             return code
 
-        yescaptcha_key = self.config.extra.get("yescaptcha_key", "")
+        # 优先从任务配置读取，兜底从全局配置读取
+        yescaptcha_key = self.config.extra.get("yescaptcha_key") or config_store.get("yescaptcha_key", "")
         reg = GrokRegister(
             yescaptcha_key=yescaptcha_key,
             proxy=self.config.proxy,

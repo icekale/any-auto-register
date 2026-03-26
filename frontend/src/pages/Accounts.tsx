@@ -357,6 +357,8 @@ const [accounts, setAccounts] = useState<any[]>([])
   const [showImport, setShowImport] = useState(false)
   const [showAdd, setShowAdd] = useState(false)
   const [showRegister, setShowRegister] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [deleting, setDeleting] = useState(false)
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search), 400)
@@ -391,6 +393,34 @@ const [accounts, setAccounts] = useState<any[]>([])
     else { const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el) }
   }
 
+  const toggleSelect = (id: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === accounts.length) setSelectedIds(new Set())
+    else setSelectedIds(new Set(accounts.map(a => a.id)))
+  }
+
+  const batchDelete = async () => {
+    if (selectedIds.size === 0) return
+    if (!confirm(`确认删除选中的 ${selectedIds.size} 个账号？`)) return
+    setDeleting(true)
+    try {
+      await apiFetch('/accounts/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: Array.from(selectedIds) })
+      })
+      setSelectedIds(new Set())
+      load()
+    } finally { setDeleting(false) }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); load() }} />}
@@ -415,9 +445,18 @@ const [accounts, setAccounts] = useState<any[]>([])
             <option value="invalid">已失效</option>
           </select>
           <span className="text-xs text-[var(--text-muted)]">{total} 个账号</span>
+          {selectedIds.size > 0 && (
+            <span className="text-xs text-[var(--text-accent)]">已选 {selectedIds.size} 个</span>
+          )}
         </div>
         {/* 右侧：操作按钮 */}
         <div className="flex items-center gap-2">
+          {selectedIds.size > 0 && (
+            <Button variant="outline" size="sm" onClick={batchDelete} disabled={deleting}
+              className="text-red-400 hover:text-red-300 border-red-400/30">
+              {deleting ? '删除中...' : `删除 ${selectedIds.size} 个`}
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={() => setShowImport(true)}><Upload className="h-4 w-4 mr-1" />导入</Button>
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={accounts.length === 0}><Download className="h-4 w-4 mr-1" />导出</Button>
           <Button variant="outline" size="sm" onClick={() => setShowAdd(true)}><Plus className="h-4 w-4 mr-1" />新增</Button>
@@ -433,6 +472,12 @@ const [accounts, setAccounts] = useState<any[]>([])
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-[var(--border)] text-[var(--text-muted)] text-xs">
+              <th className="px-4 py-3 text-left w-10">
+                <input type="checkbox"
+                  checked={accounts.length > 0 && selectedIds.size === accounts.length}
+                  onChange={toggleSelectAll}
+                  className="cursor-pointer" />
+              </th>
               <th className="px-4 py-3 text-left">邮箱</th>
               <th className="px-4 py-3 text-left">密码</th>
               <th className="px-4 py-3 text-left">状态</th>
@@ -444,11 +489,17 @@ const [accounts, setAccounts] = useState<any[]>([])
           </thead>
           <tbody>
             {accounts.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-[var(--text-muted)]">暂无账号</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-[var(--text-muted)]">暂无账号</td></tr>
             )}
             {accounts.map(acc => (
               <tr key={acc.id} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
                   onClick={() => setDetail(acc)}>
+                <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                  <input type="checkbox"
+                    checked={selectedIds.has(acc.id)}
+                    onChange={() => toggleSelect(acc.id)}
+                    className="cursor-pointer" />
+                </td>
                 <td className="px-4 py-3 font-mono text-xs">
                   <div className="flex items-center gap-1">
                     {acc.email}
