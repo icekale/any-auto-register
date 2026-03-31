@@ -140,26 +140,64 @@ def _health_ok(name: str) -> bool:
 def _find_pid_by_port(port: int) -> int | None:
     if not port:
         return None
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True,
+                creationflags=_creationflags(),
+            )
+        except Exception:
+            return None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                local = parts[1]
+                state = parts[3].upper()
+                pid = parts[4]
+                if local.endswith(f":{port}") and state == "LISTENING":
+                    try:
+                        return int(pid)
+                    except Exception:
+                        return None
+        return None
+
     try:
         out = subprocess.check_output(
-            ["netstat", "-ano", "-p", "tcp"],
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
             text=True,
             creationflags=_creationflags(),
         )
     except Exception:
         return None
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0].upper() == "TCP":
-            local = parts[1]
-            state = parts[3].upper()
-            pid = parts[4]
-            if local.endswith(f":{port}") and state == "LISTENING":
-                try:
-                    return int(pid)
-                except Exception:
-                    return None
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return int(line)
+        except Exception:
+            continue
     return None
+
+
+def _terminate_pid(pid: int):
+    if not pid:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+        return
+    subprocess.run(
+        ["kill", str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creationflags(),
+    )
 
 
 def _proc_running(name: str) -> bool:
@@ -266,7 +304,7 @@ def _status_one(name: str) -> dict[str, Any]:
         "running": running,
         "pid": pid,
         "log_path": str(_log_path(name)),
-        "last_error": _LAST_ERROR.get(name, ""),
+        "last_error": "" if running else _LAST_ERROR.get(name, ""),
         "kind": meta["kind"],
     }
 
@@ -278,6 +316,12 @@ def list_status() -> list[dict[str, Any]]:
 def _find_go() -> str | None:
     candidates = [
         shutil.which("go"),
+        str(Path("/opt/homebrew/bin/go")),
+        str(Path("/opt/homebrew/opt/go/bin/go")),
+        str(Path("/opt/homebrew/opt/go/libexec/bin/go")),
+        str(Path("/usr/local/bin/go")),
+        str(Path("/usr/local/opt/go/bin/go")),
+        str(Path("/usr/local/opt/go/libexec/bin/go")),
         str(Path.home() / "go" / "pkg" / "mod" / "golang.org" / "toolchain@v0.0.1-go1.24.10.windows-amd64" / "bin" / "go.exe"),
         str(Path.home() / "go" / "pkg" / "mod" / "golang.org" / "toolchain@v0.0.1-go1.24.0.windows-amd64" / "bin" / "go.exe"),
         r"C:\Program Files\Go\bin\go.exe",
@@ -286,6 +330,69 @@ def _find_go() -> str | None:
         if item and Path(item).exists():
             return item
     return None
+
+
+def _find_docker() -> str | None:
+    candidates = [
+        shutil.which("docker"),
+        str(Path("/opt/homebrew/bin/docker")),
+        str(Path("/usr/local/bin/docker")),
+    ]
+    for item in candidates:
+        if item and Path(item).exists():
+            return item
+    return None
+
+
+def _has_docker_compose(docker_exe: str | None) -> bool:
+    if not docker_exe:
+        return False
+    try:
+        subprocess.run(
+            [docker_exe, "compose", "version"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _cliproxyapi_compose_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["CLI_PROXY_CONFIG_PATH"] = "./config.local.yaml"
+    return env
+
+
+def _start_cliproxyapi_docker(repo: Path, log_file):
+    docker_exe = _find_docker()
+    if not _has_docker_compose(docker_exe):
+        raise RuntimeError("未找到 go，且 Docker Compose 不可用；请安装 Go 或启动 Docker Desktop")
+    subprocess.run(
+        [docker_exe, "compose", "up", "-d"],
+        cwd=str(repo),
+        check=True,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=_cliproxyapi_compose_env(),
+        creationflags=_creationflags(),
+    )
+
+
+def _stop_cliproxyapi_docker(repo: Path):
+    docker_exe = _find_docker()
+    if not _has_docker_compose(docker_exe):
+        return
+    subprocess.run(
+        [docker_exe, "compose", "down"],
+        cwd=str(repo),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_cliproxyapi_compose_env(),
+        creationflags=_creationflags(),
+    )
 
 
 def _conda_exe() -> str | None:
@@ -472,7 +579,7 @@ def _build_command(name: str) -> tuple[list[str], Path]:
     if name == "cliproxyapi":
         go_exe = _find_go()
         if not go_exe:
-            raise RuntimeError("未找到 go，可在设置中先安装 Go 或将 go.exe 加入 PATH")
+            raise RuntimeError("未找到 go，可先安装 Go，或将 go 加入 PATH")
         _ensure_cliproxyapi_runtime_config(repo)
         config_path = repo / "config.local.yaml"
         return [go_exe, "run", "./cmd/server", "-config", str(config_path)], repo
@@ -525,15 +632,22 @@ def start(name: str) -> dict[str, Any]:
 
         log_file = _open_log(name)
         try:
-            command, cwd = _build_command(name)
-            proc = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=_creationflags(),
-            )
-            _PROCS[name] = proc
+            proc = None
+            if name == "cliproxyapi" and not _find_go():
+                _ensure_cliproxyapi_runtime_config(repo)
+                _start_cliproxyapi_docker(repo, log_file)
+                _PROCS.pop(name, None)
+                _close_log(name)
+            else:
+                command, cwd = _build_command(name)
+                proc = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    creationflags=_creationflags(),
+                )
+                _PROCS[name] = proc
             _LAST_ERROR[name] = ""
         except Exception as e:
             _LAST_ERROR[name] = str(e)
@@ -560,6 +674,8 @@ def stop(name: str) -> dict[str, Any]:
         proc = _PROCS.get(name)
         port_pid = None
         desktop_pid = None
+        if name == "cliproxyapi":
+            _stop_cliproxyapi_docker(_repo_path(name))
         if _SERVICE_META[name]["kind"] == "web":
             port_pid = _find_pid_by_port(int(_SERVICE_META[name].get("port") or 0))
         else:
@@ -579,19 +695,9 @@ def stop(name: str) -> dict[str, Any]:
                 except Exception:
                     proc.kill()
         if port_pid and (not proc or port_pid != proc.pid):
-            subprocess.run(
-                ["taskkill", "/PID", str(port_pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=_creationflags(),
-            )
+            _terminate_pid(port_pid)
         if desktop_pid and (not proc or desktop_pid != proc.pid):
-            subprocess.run(
-                ["taskkill", "/PID", str(desktop_pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=_creationflags(),
-            )
+            _terminate_pid(desktop_pid)
         _PROCS.pop(name, None)
         _close_log(name)
     if _SERVICE_META[name]["kind"] == "web":
