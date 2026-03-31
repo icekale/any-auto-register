@@ -15,6 +15,14 @@
 - 本项目基于 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git) 二次开发。
 - 当前仓库在原项目基础上，扩展了本地插件拉起、Grok 账号回填、任务历史批量删除、并发注册修复等能力。
 
+### 当前版本新增功能（中文说明）
+
+- 新增 **ChatGPT 账号整体上传 CPA** 功能，可按选中账号或当前筛选结果批量上传到 CPA
+- 新增 **ChatGPT 401 检测** 功能，可批量检查 access token 是否失效
+- 新增 **一键删除 401 无效账号** 能力，便于清理失效 ChatGPT 账号
+- 优化 **外部应用启动管理**，补充本地插件 / 依赖服务的启动、停止与运行状态处理
+- 已接入 **CLIProxyAPI / CliproxyAccountCleaner** 相关本地联动入口，便于统一管理
+
 ## 插件与依赖地址说明
 
 ### 1. 临时邮箱项目来源
