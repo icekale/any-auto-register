@@ -166,6 +166,7 @@ function ActionMenu({ acc, onRefresh }: { acc: any; onRefresh: () => void }) {
 export default function Accounts() {
   const { platform } = useParams<{ platform: string }>()
   const [currentPlatform, setCurrentPlatform] = useState(platform || 'trae')
+  const isChatGPT = currentPlatform === 'chatgpt'
   const [accounts, setAccounts] = useState<any[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -186,6 +187,27 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
+  const [deleteAllLoading, setDeleteAllLoading] = useState(false)
+  const [check401Workers, setCheck401Workers] = useState(8)
+  const [checking401Scope, setChecking401Scope] = useState<'all' | 'selected' | null>(null)
+  const [deletingInvalid401, setDeletingInvalid401] = useState(false)
+  const [cpaUploadingScope, setCpaUploadingScope] = useState<'all' | 'selected' | null>(null)
+  const [check401Result, setCheck401Result] = useState<{
+    title: string
+    total: number
+    valid: number
+    invalid401: number
+    failed: number
+    workers: number
+    items: Array<{ id?: number; email?: string; ok: boolean; invalid_401: boolean; status_code?: number | null; msg: string }>
+  } | null>(null)
+  const [cpaResult, setCpaResult] = useState<{
+    title: string
+    total: number
+    success: number
+    failed: number
+    items: Array<{ id?: number; email?: string; ok: boolean; msg: string }>
+  } | null>(null)
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -243,6 +265,34 @@ export default function Accounts() {
     load()
   }
 
+  const handleDeleteAll = async () => {
+    setDeleteAllLoading(true)
+    try {
+      const result = await apiFetch('/accounts/delete-all', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: currentPlatform,
+          status: filterStatus || undefined,
+          email: search || undefined,
+        }),
+      })
+      message.success(`已删除 ${result.deleted} 个账号`)
+      setSelectedRowKeys([])
+      load()
+    } catch (e: any) {
+      let errorText = e?.message || '删除失败'
+      try {
+        const parsed = JSON.parse(errorText)
+        errorText = parsed.detail || errorText
+      } catch {
+        // noop
+      }
+      message.error(`全部删除失败: ${errorText}`)
+    } finally {
+      setDeleteAllLoading(false)
+    }
+  }
+
   const handleAdd = async () => {
     const values = await addForm.validateFields()
     await apiFetch('/accounts', {
@@ -272,6 +322,160 @@ export default function Accounts() {
       message.error(`导入失败: ${e.message}`)
     } finally {
       setImportLoading(false)
+    }
+  }
+
+  const handleCheck401 = async (scope: 'all' | 'selected') => {
+    if (!isChatGPT) return
+
+    const isSelectedScope = scope === 'selected'
+    const ids = isSelectedScope ? selectedRowKeys.map((key) => Number(key)).filter((id) => Number.isInteger(id) && id > 0) : []
+
+    if (isSelectedScope && ids.length === 0) {
+      message.warning('请先选择要检测的账号')
+      return
+    }
+
+    setChecking401Scope(scope)
+    try {
+      const payload = isSelectedScope
+        ? { ids, workers: check401Workers }
+        : {
+            status: filterStatus || undefined,
+            email: search || undefined,
+            workers: check401Workers,
+          }
+
+      const result = await apiFetch('/accounts/chatgpt/check-401', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+
+      setCheck401Result({
+        title: isSelectedScope ? `检测选中的 ${result.total} 个 ChatGPT 账号 401` : `整体检测 ${result.total} 个 ChatGPT 账号 401`,
+        total: result.total,
+        valid: result.valid,
+        invalid401: result.invalid_401,
+        failed: result.failed,
+        workers: Number(result.workers || check401Workers),
+        items: result.items || [],
+      })
+
+      if (result.invalid_401 > 0) {
+        message.warning(`401 检测完成：命中 ${result.invalid_401} 个，异常 ${result.failed} 个`)
+      } else if (result.failed > 0) {
+        message.warning(`401 检测完成：有效 ${result.valid} 个，异常 ${result.failed} 个`)
+      } else {
+        message.success(`401 检测完成：全部 ${result.valid} 个账号均正常`)
+      }
+
+      await load()
+    } catch (e: any) {
+      let errorText = e?.message || '检测失败'
+      try {
+        const parsed = JSON.parse(errorText)
+        errorText = parsed.detail || errorText
+      } catch {
+        // noop
+      }
+      message.error(`401 检测失败: ${errorText}`)
+    } finally {
+      setChecking401Scope(null)
+    }
+  }
+
+  const handleDeleteInvalid401 = async () => {
+    if (!isChatGPT) return
+
+    const ids = selectedRowKeys.map((key) => Number(key)).filter((id) => Number.isInteger(id) && id > 0)
+    const useSelected = ids.length > 0
+
+    setDeletingInvalid401(true)
+    try {
+      const payload = useSelected
+        ? { ids }
+        : {
+            status: filterStatus || undefined,
+            email: search || undefined,
+          }
+
+      const result = await apiFetch('/accounts/chatgpt/delete-invalid-401', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+
+      if (result.deleted > 0) {
+        message.success(`已删除 ${result.deleted} 个 401 无效账号，跳过 ${result.skipped} 个`)
+      } else {
+        message.warning('当前范围内没有可删除的 401 无效账号')
+      }
+
+      setSelectedRowKeys([])
+      await load()
+    } catch (e: any) {
+      let errorText = e?.message || '删除失败'
+      try {
+        const parsed = JSON.parse(errorText)
+        errorText = parsed.detail || errorText
+      } catch {
+        // noop
+      }
+      message.error(`删除 401 无效账号失败: ${errorText}`)
+    } finally {
+      setDeletingInvalid401(false)
+    }
+  }
+
+  const handleUploadCpa = async (scope: 'all' | 'selected') => {
+    if (!isChatGPT) return
+
+    const isSelectedScope = scope === 'selected'
+    const ids = isSelectedScope ? selectedRowKeys.map((key) => Number(key)).filter((id) => Number.isInteger(id) && id > 0) : []
+
+    if (isSelectedScope && ids.length === 0) {
+      message.warning('请先选择要上传的账号')
+      return
+    }
+
+    setCpaUploadingScope(scope)
+    try {
+      const payload = isSelectedScope
+        ? { ids }
+        : {
+            status: filterStatus || undefined,
+            email: search || undefined,
+          }
+      const result = await apiFetch('/accounts/chatgpt/upload-cpa', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+
+      setCpaResult({
+        title: isSelectedScope ? `上传选中的 ${result.total} 个账号到 CPA` : `整体上传 ${result.total} 个账号到 CPA`,
+        total: result.total,
+        success: result.success,
+        failed: result.failed,
+        items: result.items || [],
+      })
+
+      if (result.failed === 0) {
+        message.success(`CPA 上传完成：成功 ${result.success} 个`)
+      } else if (result.success === 0) {
+        message.error(`CPA 上传失败：共 ${result.failed} 个`)
+      } else {
+        message.warning(`CPA 上传完成：成功 ${result.success} 个，失败 ${result.failed} 个`)
+      }
+    } catch (e: any) {
+      let errorText = e?.message || '上传失败'
+      try {
+        const parsed = JSON.parse(errorText)
+        errorText = parsed.detail || errorText
+      } catch {
+        // noop
+      }
+      message.error(`CPA 上传失败: ${errorText}`)
+    } finally {
+      setCpaUploadingScope(null)
     }
   }
 
@@ -427,22 +631,134 @@ export default function Accounts() {
               { value: 'invalid', label: '已失效' },
             ]}
           />
+          {isChatGPT && (
+            <Space size={4}>
+              <Text type="secondary">401并发</Text>
+              <InputNumber
+                min={1}
+                max={64}
+                value={check401Workers}
+                onChange={(value) => setCheck401Workers(Math.min(64, Math.max(1, Number(value || 8))))}
+                style={{ width: 88 }}
+                disabled={checking401Scope !== null}
+              />
+            </Space>
+          )}
           <Text type="secondary">{total} 个账号</Text>
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
           )}
         </Space>
         <Space>
+          {total > 0 && (
+            <Popconfirm
+              title={
+                search || filterStatus
+                  ? `确认删除当前筛选的 ${total} 个 ${currentPlatform} 账号？`
+                  : `确认删除当前页面全部 ${total} 个 ${currentPlatform} 账号？`
+              }
+              onConfirm={handleDeleteAll}
+            >
+              <Button danger icon={<DeleteOutlined />} loading={deleteAllLoading}>
+                全部删除
+              </Button>
+            </Popconfirm>
+          )}
           {selectedRowKeys.length > 0 && (
             <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={handleBatchDelete}>
-              <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
+              <Button danger icon={<DeleteOutlined />} disabled={deleteAllLoading}>删除 {selectedRowKeys.length} 个</Button>
+            </Popconfirm>
+          )}
+          {isChatGPT && selectedRowKeys.length > 0 && (
+            <Popconfirm
+              title={`确认检测选中的 ${selectedRowKeys.length} 个 ChatGPT 账号是否 401 无效？`}
+              onConfirm={() => handleCheck401('selected')}
+            >
+              <Button
+                loading={checking401Scope === 'selected'}
+                disabled={checking401Scope === 'all'}
+              >
+                检测选中401
+              </Button>
+            </Popconfirm>
+          )}
+          {isChatGPT && (
+            <Popconfirm
+              title={
+                search || filterStatus
+                  ? `确认检测当前筛选的 ${total} 个 ChatGPT 账号是否 401 无效？`
+                  : `确认整体检测全部 ${total} 个 ChatGPT 账号是否 401 无效？`
+              }
+              onConfirm={() => handleCheck401('all')}
+              disabled={total === 0}
+            >
+              <Button
+                loading={checking401Scope === 'all'}
+                disabled={total === 0 || checking401Scope === 'selected'}
+              >
+                整体检测401
+              </Button>
+            </Popconfirm>
+          )}
+          {isChatGPT && (
+            <Popconfirm
+              title={
+                selectedRowKeys.length > 0
+                  ? `确认一键删除选中范围内已标记为 401 无效的账号？正常账号会自动跳过。`
+                  : search || filterStatus
+                    ? `确认一键删除当前筛选范围内已标记为 401 无效的账号？正常账号会自动跳过。`
+                    : `确认一键删除全部已标记为 401 无效的 ChatGPT 账号？正常账号会自动跳过。`
+              }
+              onConfirm={handleDeleteInvalid401}
+              disabled={total === 0}
+            >
+              <Button
+                danger
+                loading={deletingInvalid401}
+                disabled={total === 0}
+              >
+                一键删除401无效
+              </Button>
+            </Popconfirm>
+          )}
+          {isChatGPT && selectedRowKeys.length > 0 && (
+            <Popconfirm
+              title={`确认上传选中的 ${selectedRowKeys.length} 个 ChatGPT 账号到 CPA？`}
+              onConfirm={() => handleUploadCpa('selected')}
+            >
+              <Button
+                icon={<UploadOutlined />}
+                loading={cpaUploadingScope === 'selected'}
+                disabled={cpaUploadingScope === 'all'}
+              >
+                上传选中到 CPA
+              </Button>
+            </Popconfirm>
+          )}
+          {isChatGPT && (
+            <Popconfirm
+              title={
+                search || filterStatus
+                  ? `确认上传当前筛选的 ${total} 个 ChatGPT 账号到 CPA？`
+                  : `确认整体上传全部 ${total} 个 ChatGPT 账号到 CPA？`
+              }
+              onConfirm={() => handleUploadCpa('all')}
+              disabled={total === 0}
+            >
+              <Button
+                icon={<UploadOutlined />}
+                loading={cpaUploadingScope === 'all'}
+                disabled={total === 0 || cpaUploadingScope === 'selected'}
+              >
+                整体上传 CPA
+              </Button>
             </Popconfirm>
           )}
           <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
+          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} disabled={deleteAllLoading} />
         </Space>
       </div>
 
@@ -569,6 +885,89 @@ export default function Accounts() {
               <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
             </Form.Item>
           </Form>
+        )}
+      </Modal>
+
+      <Modal
+        title={check401Result?.title || '401 检测结果'}
+        open={Boolean(check401Result)}
+        onCancel={() => setCheck401Result(null)}
+        onOk={() => setCheck401Result(null)}
+        width={760}
+        maskClosable={false}
+      >
+        {check401Result && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ fontSize: 13, color: '#475569' }}>
+              总计 {check401Result.total} 个，有效 {check401Result.valid} 个，401 无效 {check401Result.invalid401} 个，异常 {check401Result.failed} 个，并发 {check401Result.workers}
+            </div>
+            <div
+              style={{
+                maxHeight: 360,
+                overflow: 'auto',
+                padding: 12,
+                border: '1px solid #e5e7eb',
+                borderRadius: 8,
+                background: '#fafafa',
+                fontFamily: 'monospace',
+                fontSize: 12,
+                whiteSpace: 'pre-wrap',
+              }}
+            >
+              {check401Result.items.map((item, index) => {
+                const color = item.invalid_401 ? '#dc2626' : item.ok ? '#059669' : '#d97706'
+                const prefix = item.invalid_401 ? '401' : item.ok ? '✓' : '!'
+                const statusText = item.status_code ? ` [HTTP ${item.status_code}]` : ''
+                return (
+                  <div
+                    key={`${item.id || item.email || 'row'}-${index}`}
+                    style={{ color, lineHeight: 1.6 }}
+                  >
+                    {prefix} {item.email || `账号 ${item.id || '-'}`}{statusText} - {item.msg}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        title={cpaResult?.title || 'CPA 上传结果'}
+        open={Boolean(cpaResult)}
+        onCancel={() => setCpaResult(null)}
+        onOk={() => setCpaResult(null)}
+        width={760}
+        maskClosable={false}
+      >
+        {cpaResult && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ fontSize: 13, color: '#475569' }}>
+              总计 {cpaResult.total} 个，成功 {cpaResult.success} 个，失败 {cpaResult.failed} 个
+            </div>
+            <div
+              style={{
+                maxHeight: 360,
+                overflow: 'auto',
+                padding: 12,
+                border: '1px solid #e5e7eb',
+                borderRadius: 8,
+                background: '#fafafa',
+                fontFamily: 'monospace',
+                fontSize: 12,
+                whiteSpace: 'pre-wrap',
+              }}
+            >
+              {cpaResult.items.map((item, index) => (
+                <div
+                  key={`${item.id || item.email || 'row'}-${index}`}
+                  style={{ color: item.ok ? '#059669' : '#dc2626', lineHeight: 1.6 }}
+                >
+                  {item.ok ? '✓' : '✗'} {item.email || `账号 ${item.id || '-'}`} - {item.msg}
+                </div>
+              ))}
+            </div>
+          </div>
         )}
       </Modal>
     </div>
