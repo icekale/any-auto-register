@@ -308,7 +308,7 @@ def batch_upload_chatgpt_cpa(
     if not api_url:
         raise HTTPException(400, "CPA API URL 未配置，请先在设置页填写")
 
-    from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
+    from services.chatgpt_sync import upload_account_model_to_cpa
 
     summary = {
         "total": len(rows),
@@ -329,34 +329,12 @@ def batch_upload_chatgpt_cpa(
             })
             continue
 
-        extra = row.get_extra()
-        access_token = extra.get("access_token") or row.token
-        refresh_token = extra.get("refresh_token", "")
-        id_token = extra.get("id_token", "")
-
-        if not access_token:
-            summary["failed"] += 1
-            summary["items"].append({
-                "id": row.id,
-                "email": row.email,
-                "ok": False,
-                "msg": "缺少 access_token，无法上传",
-            })
-            continue
-
-        class _Acc:
-            pass
-
-        account = _Acc()
-        account.email = row.email
-        account.access_token = access_token
-        account.refresh_token = refresh_token
-        account.id_token = id_token
-
-        ok, msg = upload_to_cpa(
-            generate_token_json(account),
+        ok, msg = upload_account_model_to_cpa(
+            row,
+            session=session,
             api_url=api_url,
             api_key=api_key,
+            commit=False,
         )
         if ok:
             summary["success"] += 1
@@ -368,6 +346,13 @@ def batch_upload_chatgpt_cpa(
             "ok": ok,
             "msg": msg,
         })
+
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.exception("批量上传 ChatGPT 账号到 CPA 后写入状态失败")
+        raise HTTPException(500, f"批量上传 ChatGPT 账号到 CPA 后写入状态失败: {str(e)}")
 
     return summary
 

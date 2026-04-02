@@ -128,11 +128,15 @@ class CpaUploadReq(BaseModel):
 def upload_cpa(account_id: int, req: CpaUploadReq,
                session: Session = Depends(get_session)):
     acc = _get_account(account_id, session)
-    codex_acc = _to_codex_account(acc)
+    from services.chatgpt_sync import upload_account_model_to_cpa
 
-    from platforms.chatgpt.cpa_upload import upload_to_cpa, generate_token_json
-    token_data = generate_token_json(codex_acc)
-    ok, msg = upload_to_cpa(token_data, api_url=req.api_url, api_key=req.api_key)
+    ok, msg = upload_account_model_to_cpa(
+        acc,
+        session=session,
+        api_url=req.api_url,
+        api_key=(req.api_key or "").strip() or None,
+        commit=True,
+    )
     return {"ok": ok, "message": msg}
 
 
