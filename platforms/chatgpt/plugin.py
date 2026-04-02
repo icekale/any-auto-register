@@ -4,8 +4,12 @@ import random
 import string
 
 from core.base_mailbox import BaseMailbox
-from core.base_platform import Account, AccountStatus, BasePlatform, RegisterConfig
+from core.base_platform import Account, BasePlatform, RegisterConfig
 from core.registry import register
+from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+    ChatGPTRegistrationContext,
+    build_chatgpt_registration_mode_adapter,
+)
 
 
 @register
@@ -40,15 +44,13 @@ class ChatGPTPlatform(BasePlatform):
 
         proxy = self.config.proxy if self.config else None
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
+        extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
         log_fn = getattr(self, "_log_fn", print)
-        from platforms.chatgpt.register_v2 import RegistrationEngineV2 as RegistrationEngine
-
         max_retries = 3
-        if self.config and getattr(self.config, "extra", None):
-            try:
-                max_retries = int((self.config.extra or {}).get("register_max_retries", 3) or 3)
-            except Exception:
-                max_retries = 3
+        try:
+            max_retries = int(extra_config.get("register_max_retries", 3) or 3)
+        except Exception:
+            max_retries = 3
 
         if self.mailbox:
             _mailbox = self.mailbox
@@ -97,20 +99,12 @@ class ChatGPTPlatform(BasePlatform):
                 def status(self):
                     return None
 
-            engine = RegistrationEngine(
-                email_service=GenericEmailService(),
-                proxy_url=proxy,
-                browser_mode=browser_mode,
-                callback_logger=log_fn,
-                max_retries=max_retries,
-                extra_config=(self.config.extra or {}),
-            )
-            engine.email = email
-            engine.password = password
+            email_service = GenericEmailService()
         else:
             from core.base_mailbox import TempMailLolMailbox
 
             _tmail = TempMailLolMailbox(proxy=proxy)
+            _tmail._task_control = getattr(self, "_task_control", None)
 
             class TempMailEmailService:
                 service_type = type("ST", (), {"value": "tempmail_lol"})()
@@ -144,40 +138,29 @@ class ChatGPTPlatform(BasePlatform):
                 def status(self):
                     return None
 
-            engine = RegistrationEngine(
-                email_service=TempMailEmailService(),
-                proxy_url=proxy,
-                browser_mode=browser_mode,
-                callback_logger=log_fn,
-                max_retries=max_retries,
-                extra_config=(self.config.extra or {}),
-            )
-            if email:
-                engine.email = email
-                engine.password = password
+            email_service = TempMailEmailService()
 
-        result = engine.run()
+        adapter = build_chatgpt_registration_mode_adapter(extra_config)
+        context = ChatGPTRegistrationContext(
+            email_service=email_service,
+            proxy_url=proxy,
+            callback_logger=log_fn,
+            email=email,
+            password=password,
+            browser_mode=browser_mode,
+            max_retries=max_retries,
+            extra_config=extra_config,
+        )
+        result = adapter.run(context)
         if not result or not result.success:
             raise RuntimeError(result.error_message if result else "注册失败")
 
-        return Account(
-            platform="chatgpt",
-            email=result.email,
-            password=result.password or password,
-            user_id=result.account_id,
-            token=result.access_token,
-            status=AccountStatus.REGISTERED,
-            extra={
-                "access_token": result.access_token,
-                "refresh_token": result.refresh_token,
-                "id_token": result.id_token,
-                "session_token": result.session_token,
-                "workspace_id": result.workspace_id,
-            },
-        )
+        return adapter.build_account(result, password)
 
     def get_platform_actions(self) -> list:
         return [
+            {"id": "probe_local_status", "label": "探测本地状态", "params": []},
+            {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {
                 "id": "payment_link",
@@ -236,6 +219,50 @@ class ChatGPTPlatform(BasePlatform):
         a.session_token = extra.get("session_token", "")
         a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
         a.cookies = extra.get("cookies", "")
+        a.user_id = account.user_id
+
+        if action_id == "probe_local_status":
+            from platforms.chatgpt.status_probe import probe_local_chatgpt_status
+
+            probe_result = probe_local_chatgpt_status(a, proxy=proxy)
+            summary = (
+                f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
+                f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
+                f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "message": f"本地状态探测完成：{summary}",
+                    "probe": probe_result,
+                },
+                "account_extra_patch": {
+                    "chatgpt_local": probe_result,
+                },
+            }
+
+        if action_id == "sync_cliproxyapi_status":
+            from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
+
+            sync_result = sync_chatgpt_cliproxyapi_status(a)
+            ok = bool(sync_result.get("uploaded")) and sync_result.get("remote_state") not in {"unreachable", "not_found"}
+            summary = (
+                f"远端状态={sync_result.get('status') or 'not_found'}, "
+                f"探测={sync_result.get('remote_state') or 'not_checked'}"
+            )
+            return {
+                "ok": ok,
+                "data": {
+                    "message": f"CLIProxyAPI 状态同步完成：{summary}",
+                    "sync": sync_result,
+                },
+                "error": sync_result.get("message") if not ok else "",
+                "account_extra_patch": {
+                    "sync_statuses": {
+                        "cliproxyapi": sync_result,
+                    },
+                },
+            }
 
         if action_id == "refresh_token":
             from platforms.chatgpt.token_refresh import TokenRefreshManager

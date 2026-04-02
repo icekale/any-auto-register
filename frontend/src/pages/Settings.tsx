@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -11,20 +11,23 @@ import {
   CloseCircleOutlined,
   SyncOutlined,
   PlusOutlined,
+  LockOutlined,
 } from '@ant-design/icons'
+import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch } from '@/lib/utils'
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
+    { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
     { label: 'MoeMail (sall.cc)', value: 'moemail' },
     { label: 'YYDS Mail / MaliAPI', value: 'maliapi' },
+    { label: 'GPTMail', value: 'gptmail' },
     { label: 'Freemail（自建 CF Worker）', value: 'freemail' },
     { label: 'CF Worker（自建域名）', value: 'cfworker' },
-    { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
   ],
   maliapi_auto_domain_strategy: [
     { label: 'balanced', value: 'balanced' },
@@ -118,6 +121,15 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: 'GPTMail',
+        desc: '基于 GPTMail API 生成临时邮箱并轮询邮件；若已知本站可用域名，也可本地拼装随机地址',
+        fields: [
+          { key: 'gptmail_base_url', label: 'API URL', placeholder: 'https://mail.chatgpt.org.uk' },
+          { key: 'gptmail_api_key', label: 'API Key', secret: true, placeholder: 'gpt-test' },
+          { key: 'gptmail_domain', label: '邮箱域名（可选）', placeholder: 'example.com' },
+        ],
+      },
+      {
         title: 'TempMail.lol',
         desc: '自动生成邮箱，无需配置，需要代理访问（CN IP 被封）',
         fields: [],
@@ -140,6 +152,8 @@ const TAB_ITEMS = [
           { key: 'cfworker_api_url', label: 'API URL', placeholder: 'https://apimail.example.com' },
           { key: 'cfworker_admin_token', label: '管理员 Token', secret: true },
           { key: 'cfworker_custom_auth', label: '站点密码', secret: true },
+          { key: 'cfworker_subdomain', label: '固定子域名', placeholder: 'mail / pool-a' },
+          { key: 'cfworker_random_subdomain', label: '随机子域名', type: 'boolean' },
           { key: 'cfworker_fingerprint', label: 'Fingerprint', placeholder: '6703363b...' },
         ],
       },
@@ -242,6 +256,7 @@ const TAB_ITEMS = [
         title: '管理面板',
         desc: '用于 CLIProxyAPI 管理页登录',
         fields: [
+          { key: 'cliproxyapi_base_url', label: 'API URL', placeholder: 'http://127.0.0.1:8317' },
           { key: 'cliproxyapi_management_key', label: '管理口令', secret: true, placeholder: '默认 cliproxyapi' },
         ],
       },
@@ -293,13 +308,19 @@ const TAB_ITEMS = [
     icon: <ApiOutlined />,
     sections: [],
   },
+  {
+    key: 'security',
+    label: '安全',
+    icon: <LockOutlined />,
+    sections: [],
+  },
 ]
 
 interface FieldConfig {
   key: string
   label: string
   placeholder?: string
-  type?: 'select' | 'input'
+  type?: 'select' | 'input' | 'boolean'
   secret?: boolean
 }
 
@@ -363,15 +384,23 @@ function parseStoredDomainList(value: unknown): string[] {
 function ConfigField({ field }: { field: FieldConfig }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
+  const isBooleanField = field.type === 'boolean'
   const helpText =
     field.key === 'default_executor'
       ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily、Trae 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
       : undefined
 
   return (
-    <Form.Item label={field.label} name={field.key} extra={helpText}>
+    <Form.Item
+      label={field.label}
+      name={field.key}
+      extra={helpText}
+      valuePropName={isBooleanField ? 'checked' : undefined}
+    >
       {options ? (
         <Select options={options} style={{ width: '100%' }} />
+      ) : isBooleanField ? (
+        <Switch checkedChildren="开启" unCheckedChildren="关闭" />
       ) : field.secret ? (
         <Input.Password
           placeholder={field.placeholder}
@@ -764,6 +793,250 @@ function IntegrationsPanel() {
   )
 }
 
+type TotpSetupState = 'idle' | 'setup'
+
+function SecurityPanel() {
+  const { message: msg } = App.useApp()
+  const [status, setStatus] = useState<{ has_password: boolean; has_totp: boolean } | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const [enableForm] = Form.useForm()
+  const [pwForm] = Form.useForm()
+  const [codeForm] = Form.useForm()
+
+  const [totpSetupState, setTotpSetupState] = useState<TotpSetupState>('idle')
+  const [totpSecret, setTotpSecret] = useState('')
+  const [totpUri, setTotpUri] = useState('')
+
+  const loadStatus = async () => {
+    try {
+      const s = await apiFetch('/auth/status')
+      setStatus(s)
+    } catch {}
+  }
+
+  useEffect(() => { loadStatus() }, [])
+
+  const handleEnable = async (values: { password: string; confirm: string }) => {
+    if (values.password !== values.confirm) {
+      msg.error('两次输入的密码不一致')
+      return
+    }
+    setLoading(true)
+    try {
+      const d = await apiFetch('/auth/setup', {
+        method: 'POST',
+        body: JSON.stringify({ password: values.password }),
+      })
+      localStorage.setItem('auth_token', d.access_token)
+      msg.success('密码保护已启用')
+      enableForm.resetFields()
+      await loadStatus()
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleDisableAuth = async () => {
+    setLoading(true)
+    try {
+      await apiFetch('/auth/disable', { method: 'POST' })
+      localStorage.removeItem('auth_token')
+      msg.success('密码保护已关闭')
+      await loadStatus()
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleChangePassword = async (values: { current_password: string; new_password: string; confirm: string }) => {
+    if (values.new_password !== values.confirm) {
+      msg.error('两次输入的新密码不一致')
+      return
+    }
+    setLoading(true)
+    try {
+      await apiFetch('/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ current_password: values.current_password, new_password: values.new_password }),
+      })
+      msg.success('密码已更新')
+      pwForm.resetFields()
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSetupTotp = async () => {
+    setLoading(true)
+    try {
+      const d = await apiFetch('/auth/2fa/setup')
+      setTotpSecret(d.secret)
+      setTotpUri(d.uri)
+      setTotpSetupState('setup')
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleEnableTotp = async (values: { code: string }) => {
+    setLoading(true)
+    try {
+      await apiFetch('/auth/2fa/enable', {
+        method: 'POST',
+        body: JSON.stringify({ secret: totpSecret, code: values.code }),
+      })
+      msg.success('双因素认证已启用')
+      setTotpSetupState('idle')
+      codeForm.resetFields()
+      await loadStatus()
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleDisableTotp = async () => {
+    setLoading(true)
+    try {
+      await apiFetch('/auth/2fa/disable', { method: 'POST' })
+      msg.success('双因素认证已关闭')
+      await loadStatus()
+    } catch (e: any) {
+      msg.error(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <Card
+        title="访问密码保护"
+        extra={
+          status?.has_password
+            ? <Tag color="green"><CheckCircleOutlined /> 已启用</Tag>
+            : <Tag color="default"><CloseCircleOutlined /> 未启用</Tag>
+        }
+      >
+        {!status?.has_password ? (
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Typography.Text type="secondary">
+              启用后，访问页面需要输入密码。默认不开启，任何能访问此地址的人均可使用。
+            </Typography.Text>
+            <Form form={enableForm} layout="vertical" onFinish={handleEnable} requiredMark={false} style={{ maxWidth: 360, marginTop: 8 }}>
+              <Form.Item name="password" label="设置访问密码" rules={[{ required: true, message: '请输入密码' }, { min: 6, message: '至少 6 位' }]}>
+                <Input.Password placeholder="至少 6 位" />
+              </Form.Item>
+              <Form.Item name="confirm" label="确认密码" rules={[{ required: true, message: '请再次输入' }]}>
+                <Input.Password placeholder="再次输入密码" />
+              </Form.Item>
+              <Form.Item style={{ marginBottom: 0 }}>
+                <Button type="primary" htmlType="submit" loading={loading} icon={<LockOutlined />}>
+                  启用密码保护
+                </Button>
+              </Form.Item>
+            </Form>
+          </Space>
+        ) : (
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Typography.Text type="secondary">当前已启用密码保护，关闭后任何人无需密码即可访问。</Typography.Text>
+            <Button danger loading={loading} onClick={handleDisableAuth}>
+              关闭密码保护
+            </Button>
+          </Space>
+        )}
+      </Card>
+
+      {status?.has_password && (
+        <>
+          <Card title="修改密码">
+            <Form form={pwForm} layout="vertical" onFinish={handleChangePassword} requiredMark={false} style={{ maxWidth: 360 }}>
+              <Form.Item name="current_password" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
+                <Input.Password placeholder="当前密码" />
+              </Form.Item>
+              <Form.Item name="new_password" label="新密码" rules={[{ required: true, message: '请输入新密码' }, { min: 6, message: '至少 6 位' }]}>
+                <Input.Password placeholder="新密码（至少 6 位）" />
+              </Form.Item>
+              <Form.Item name="confirm" label="确认新密码" rules={[{ required: true, message: '请再次输入' }]}>
+                <Input.Password placeholder="再次输入新密码" />
+              </Form.Item>
+              <Form.Item style={{ marginBottom: 0 }}>
+                <Button type="primary" htmlType="submit" loading={loading} icon={<SaveOutlined />}>
+                  更新密码
+                </Button>
+              </Form.Item>
+            </Form>
+          </Card>
+
+          <Card
+            title="双因素认证 (2FA)"
+            extra={
+              status?.has_totp
+                ? <Tag color="green"><CheckCircleOutlined /> 已启用</Tag>
+                : <Tag color="default"><CloseCircleOutlined /> 未启用</Tag>
+            }
+          >
+            {status?.has_totp ? (
+              <Space direction="vertical">
+                <Typography.Text type="secondary">
+                  登录时需输入 Google Authenticator / Authy 等 App 中的 6 位验证码。
+                </Typography.Text>
+                <Button danger loading={loading} onClick={handleDisableTotp}>
+                  关闭双因素认证
+                </Button>
+              </Space>
+            ) : totpSetupState === 'idle' ? (
+              <Space direction="vertical">
+                <Typography.Text type="secondary">
+                  启用后，登录时除密码外还需输入验证器 App 中的 6 位验证码，大幅提升安全性。
+                </Typography.Text>
+                <Button type="primary" loading={loading} onClick={handleSetupTotp} icon={<SafetyOutlined />}>
+                  开启双因素认证
+                </Button>
+              </Space>
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }}>
+                <Typography.Text strong>1. 用验证器 App 扫描下方二维码</Typography.Text>
+                <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                  <QRCode value={totpUri} size={180} />
+                  <div style={{ flex: 1 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>无法扫码？手动输入密钥：</Typography.Text>
+                    <Typography.Paragraph copyable style={{ fontFamily: 'monospace', fontSize: 13, marginTop: 4 }}>
+                      {totpSecret}
+                    </Typography.Paragraph>
+                  </div>
+                </div>
+                <Typography.Text strong>2. 输入 App 中显示的 6 位验证码以确认绑定</Typography.Text>
+                <Form form={codeForm} layout="inline" onFinish={handleEnableTotp}>
+                  <Form.Item name="code" rules={[{ required: true, message: '请输入验证码' }, { len: 6, message: '6 位数字' }]}>
+                    <Input placeholder="000000" maxLength={6} style={{ width: 140, letterSpacing: 4, textAlign: 'center' }} />
+                  </Form.Item>
+                  <Form.Item>
+                    <Button type="primary" htmlType="submit" loading={loading}>确认启用</Button>
+                  </Form.Item>
+                  <Form.Item>
+                    <Button onClick={() => setTotpSetupState('idle')}>取消</Button>
+                  </Form.Item>
+                </Form>
+              </Space>
+            )}
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function Settings() {
   const [form] = Form.useForm()
   const [saving, setSaving] = useState(false)
@@ -772,6 +1045,12 @@ export default function Settings() {
 
   useEffect(() => {
     apiFetch('/config').then((data) => {
+      if (!data.mail_provider) {
+        data.mail_provider = 'luckmail'
+      }
+      if (!data.gptmail_base_url) {
+        data.gptmail_base_url = 'https://mail.chatgpt.org.uk'
+      }
       if (!data.maliapi_base_url) {
         data.maliapi_base_url = 'https://maliapi.215.im/v1'
       }
@@ -780,6 +1059,7 @@ export default function Settings() {
       }
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
+      data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       form.setFieldsValue(data)
     })
   }, [form])
@@ -802,12 +1082,14 @@ export default function Settings() {
       if (domains.length > 0) {
         values.cfworker_domain = ''
       }
+      values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
+        cfworker_random_subdomain: values.cfworker_random_subdomain,
       })
       message.success('保存成功')
       setSaved(true)
@@ -847,6 +1129,8 @@ export default function Settings() {
         <div style={{ flex: 1 }}>
           {activeTab === 'integrations' ? (
             <IntegrationsPanel />
+          ) : activeTab === 'security' ? (
+            <SecurityPanel />
           ) : (
             <Form form={form} layout="vertical">
               {activeTab === 'captcha' ? <SolverStatus /> : null}

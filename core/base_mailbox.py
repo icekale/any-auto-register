@@ -2,10 +2,11 @@
 
 import json
 import random
+import time
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from .proxy_utils import build_requests_proxy_config
 
 
@@ -21,6 +22,45 @@ class BaseMailbox(ABC):
         log_fn = getattr(self, "_log_fn", None)
         if callable(log_fn):
             log_fn(message)
+
+    def _checkpoint(self, *, consume_skip: bool = True) -> None:
+        task_control = getattr(self, "_task_control", None)
+        if task_control is None:
+            return
+        task_control.checkpoint(consume_skip=consume_skip)
+
+    def _sleep_with_checkpoint(self, seconds: float) -> None:
+        remaining = max(float(seconds or 0), 0.0)
+        while remaining > 0:
+            self._checkpoint()
+            chunk = min(0.25, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def _run_polling_wait(
+        self,
+        *,
+        timeout: int,
+        poll_interval: float,
+        poll_once: Callable[[], Optional[str]],
+        timeout_message: str | None = None,
+    ) -> str:
+        timeout_seconds = max(int(timeout or 0), 1)
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            self._checkpoint()
+            code = poll_once()
+            if code:
+                return code
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._sleep_with_checkpoint(min(float(poll_interval), remaining))
+
+        self._checkpoint()
+        raise TimeoutError(timeout_message or f"等待验证码超时 ({timeout_seconds}s)")
 
     @abstractmethod
     def get_email(self) -> MailboxAccount:
@@ -99,7 +139,72 @@ class BaseMailbox(ABC):
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合（用于过滤旧邮件）"""
         ...
+    def _yyds_safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
+        """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
+        import re
 
+        text = str(text or "")
+        if not text:
+            return None
+
+        # [修复点 1]：优先过滤掉所有 URL 链接，直接从根源防止提取到追踪链接（如 SendGrid）里的随机数字
+        text = re.sub(r"https?://\S+", "", text)
+
+        patterns = []
+        if pattern:
+            # [修复点 2]：如果外部传入了纯 \d{6} 的粗糙正则，自动为其加上字母数字边界
+            if pattern in (r"\d{6}", r"(\d{6})"):
+                patterns.append(r"(?<![a-zA-Z0-9])(\d{6})(?![a-zA-Z0-9])")
+            else:
+                patterns.append(pattern)
+
+        # 先匹配带明显语义的验证码，避免误提取 MIME boundary、时间戳等 6 位数字。
+        patterns.extend(
+            [
+                r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
+                r"(?is)\bcode\b[^0-9]{0,12}(\d{6})",
+                # [修复点 3]：修改兜底正则，严格要求 6 位数字前后不能有字母或数字（防止匹配 u20216706）
+                r"(?<![a-zA-Z0-9])(\d{6})(?![a-zA-Z0-9])",
+            ]
+        )
+
+        for regex in patterns:
+            m = re.search(regex, text)
+            if m:
+                # 兼容逻辑：若 pattern 中有捕获组则取 group(1)，否则取 group(0)
+                return m.group(1) if m.groups() else m.group(0)
+        return None
+
+    def _yyds_decode_raw_content(self, raw: str) -> str:
+        """解析邮件原始文本 (借鉴自 Fugle)，处理 Quoted-Printable 和 HTML 实体"""
+        import quopri, html, re
+
+        text = str(raw or "")
+        if not text:
+            return ""
+            
+        # [修复点 4]：只有在明确包含常见邮件 Header 时，才进行 \r\n\r\n 切分。
+        # 否则会误删 MaliAPI 等直接返回的已解析 JSON 正文内容（遇到普通的正文换行就错误截断了）
+        if re.search(r"(?im)^(?:Return-Path|Received|Date|From|To|Subject|Content-Type):", text):
+            if "\r\n\r\n" in text:
+                text = text.split("\r\n\r\n", 1)[1]
+            elif "\n\n" in text:
+                text = text.split("\n\n", 1)[1]
+                
+        try:
+            # 处理 Quoted-Printable
+            decoded_bytes = quopri.decodestring(text)
+            text = decoded_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        # 清除 HTML 标签并反转义
+        text = html.unescape(text)
+        text = re.sub(r"(?im)^content-(?:type|transfer-encoding):.*$", " ", text)
+        text = re.sub(r"(?im)^--+[_=\w.-]+$", " ", text)
+        text = re.sub(r"(?i)----=_part_[\w.]+", " ", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
 def create_mailbox(
     provider: str, extra: dict = None, proxy: str = None
@@ -147,6 +252,13 @@ def create_mailbox(
             auto_domain_strategy=extra.get("maliapi_auto_domain_strategy", ""),
             proxy=proxy,
         )
+    elif provider == "gptmail":
+        return GPTMailMailbox(
+            api_url=extra.get("gptmail_base_url", "https://mail.chatgpt.org.uk"),
+            api_key=extra.get("gptmail_api_key", ""),
+            domain=extra.get("gptmail_domain", ""),
+            proxy=proxy,
+        )
     elif provider == "cfworker":
         return CFWorkerMailbox(
             api_url=extra.get("cfworker_api_url", ""),
@@ -155,6 +267,8 @@ def create_mailbox(
             domain_override=extra.get("cfworker_domain_override", ""),
             domains=extra.get("cfworker_domains", ""),
             enabled_domains=extra.get("cfworker_enabled_domains", ""),
+            subdomain=extra.get("cfworker_subdomain", ""),
+            random_subdomain=extra.get("cfworker_random_subdomain", False),
             fingerprint=extra.get("cfworker_fingerprint", ""),
             custom_auth=extra.get("cfworker_custom_auth", ""),
             proxy=proxy,
@@ -231,13 +345,12 @@ class LaoudoMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time
         from curl_cffi import requests as curl_requests
 
         seen = set(before_ids) if before_ids else set()
-        start = time.time()
         h = {"authorization": self.auth, "user-agent": self._ua}
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 r = curl_requests.get(
                     f"{self.api}/list",
@@ -272,8 +385,13 @@ class LaoudoMailbox(BaseMailbox):
                             return code
             except Exception:
                 pass
-            time.sleep(4)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=4,
+            poll_once=poll_once,
+        )
 
 
 class AitreMailbox(BaseMailbox):
@@ -307,12 +425,13 @@ class AitreMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time, requests
+        import requests
 
         seen = set(before_ids) if before_ids else set()
         last_check = None
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
+            nonlocal last_check
             params = {"email": account.email}
             if last_check:
                 params["lastCheck"] = last_check
@@ -339,8 +458,13 @@ class AitreMailbox(BaseMailbox):
                             return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class TempMailLolMailbox(BaseMailbox):
@@ -390,13 +514,12 @@ class TempMailLolMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time, requests
+        import requests
 
         seen = set(before_ids or [])
         otp_sent_at = kwargs.get("otp_sent_at")
-        otp_cutoff = float(otp_sent_at) - 2 if otp_sent_at else None
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 r = requests.get(
                     f"{self.api}/inbox",
@@ -429,8 +552,13 @@ class TempMailLolMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class SkyMailMailbox(BaseMailbox):
@@ -536,12 +664,10 @@ class SkyMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import time
-
         target = account.account_id or account.email
         seen = set(before_ids or [])
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 mails = self._list_mails(target)
                 for i, msg in enumerate(mails):
@@ -575,9 +701,13 @@ class SkyMailMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
+            return None
 
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class DuckMailMailbox(BaseMailbox):
@@ -688,11 +818,11 @@ class DuckMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time
+        import re
 
         seen = set(before_ids or [])
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 r = self._request("GET", "/messages?page=1", token=account.account_id)
                 msgs = r.json().get("hydra:member", [])
@@ -722,8 +852,13 @@ class DuckMailMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class MaliAPIMailbox(BaseMailbox):
@@ -874,12 +1009,11 @@ class MaliAPIMailbox(BaseMailbox):
         **kwargs,
     ) -> str:
         import re
-        import time
 
         self._ensure_api_key()
         seen = {str(mid) for mid in (before_ids or set())}
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 for message in self._list_messages(account):
                     message_id = str(message.get("id") or "").strip()
@@ -901,6 +1035,199 @@ class MaliAPIMailbox(BaseMailbox):
                             str(message.get("snippet") or ""),
                         ]
                     ).strip()
+                    search_text = self._yyds_decode_raw_content(search_text) or search_text
+                    search_text = re.sub(
+                        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                        "",
+                        search_text,
+                    )
+                    if keyword and keyword.lower() not in search_text.lower():
+                        continue
+
+                    code = self._yyds_safe_extract(search_text, code_pattern)
+                    if code:
+                        self._log(f"[MaliAPI] 收到验证码: {code}")
+                        return code
+            except Exception:
+                pass
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
+
+
+class GPTMailMailbox(BaseMailbox):
+    """GPTMail 临时邮箱服务"""
+
+    def __init__(
+        self,
+        api_url: str = "https://mail.chatgpt.org.uk",
+        api_key: str = "",
+        domain: str = "",
+        proxy: str = None,
+    ):
+        self.api = (api_url or "https://mail.chatgpt.org.uk").rstrip("/")
+        self.api_key = str(api_key or "").strip()
+        self.domain = self._normalize_domain(domain)
+        self.proxy = build_requests_proxy_config(proxy)
+        self._email = None
+
+    @staticmethod
+    def _normalize_domain(value: Any) -> str:
+        domain = str(value or "").strip().lower()
+        if domain.startswith("@"):
+            domain = domain[1:]
+        return domain
+
+    @staticmethod
+    def _generate_local_part() -> str:
+        import string
+
+        prefix = "".join(random.choices(string.ascii_lowercase, k=6))
+        suffix = "".join(random.choices(string.digits, k=4))
+        return f"{prefix}{suffix}"
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"accept": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        return headers
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        timeout: int = 15,
+    ) -> Any:
+        import requests
+
+        response = requests.request(
+            method,
+            f"{self.api}{path}",
+            params=params,
+            json=json_body,
+            headers=self._headers(),
+            proxies=self.proxy,
+            timeout=timeout,
+        )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            preview = (response.text or "")[:200]
+            raise RuntimeError(
+                f"GPTMail API {path} 返回非 JSON: HTTP {response.status_code} {preview}"
+            ) from exc
+
+        if response.status_code >= 400:
+            error = payload.get("error") if isinstance(payload, dict) else ""
+            message = str(error or response.text or f"HTTP {response.status_code}").strip()
+            raise RuntimeError(f"GPTMail API {path} 失败: {message}")
+
+        if isinstance(payload, dict) and payload.get("success") is False:
+            error = str(payload.get("error") or "unknown error").strip()
+            raise RuntimeError(f"GPTMail API {path} 失败: {error}")
+
+        if isinstance(payload, dict) and "data" in payload:
+            return payload.get("data")
+        return payload
+
+    def _list_messages(self, email: str) -> list[dict]:
+        data = self._request_json("GET", "/api/emails", params={"email": email}, timeout=10)
+        if isinstance(data, dict):
+            messages = data.get("emails", [])
+        else:
+            messages = data
+        return [item for item in (messages or []) if isinstance(item, dict)]
+
+    def _get_message_detail(self, message_id: str) -> dict[str, Any]:
+        data = self._request_json("GET", f"/api/email/{message_id}", timeout=10)
+        return data if isinstance(data, dict) else {}
+
+    def get_email(self) -> MailboxAccount:
+        if self.domain:
+            email = f"{self._generate_local_part()}@{self.domain}"
+            self._email = email
+            self._log(f"[GPTMail] 本地拼装邮箱: {email}")
+            return MailboxAccount(
+                email=email,
+                account_id=email,
+                extra={"provider": "gptmail", "domain": self.domain, "local_address": True},
+            )
+
+        data = self._request_json("GET", "/api/generate-email")
+        if not isinstance(data, dict):
+            raise RuntimeError(f"GPTMail 返回异常: {data}")
+
+        email = str(data.get("email") or "").strip()
+        if not email:
+            raise RuntimeError(f"GPTMail 返回空邮箱: {data}")
+
+        self._email = email
+        self._log(f"[GPTMail] 生成邮箱: {email}")
+        return MailboxAccount(
+            email=email,
+            account_id=email,
+            extra={"provider": "gptmail"},
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        try:
+            return {
+                str(message.get("id"))
+                for message in self._list_messages(account.email)
+                if message.get("id") is not None
+            }
+        except Exception:
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        import re
+
+        seen = {str(mid) for mid in (before_ids or set())}
+        exclude_codes = {
+            str(code) for code in (kwargs.get("exclude_codes") or set()) if code
+        }
+
+        def poll_once() -> Optional[str]:
+            try:
+                messages = self._list_messages(account.email)
+                for message in messages:
+                    message_id = str(message.get("id") or "").strip()
+                    if not message_id or message_id in seen:
+                        continue
+                    seen.add(message_id)
+
+                    try:
+                        detail = self._get_message_detail(message_id)
+                    except Exception:
+                        detail = {}
+
+                    search_text = " ".join(
+                        [
+                            str(message.get("subject") or ""),
+                            str(message.get("from_address") or ""),
+                            str(message.get("content") or ""),
+                            str(message.get("html_content") or ""),
+                            str(detail.get("subject") or ""),
+                            str(detail.get("content") or ""),
+                            str(detail.get("html_content") or ""),
+                            str(detail.get("raw_headers") or ""),
+                        ]
+                    ).strip()
                     search_text = self._decode_raw_content(search_text) or search_text
                     search_text = re.sub(
                         r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -911,13 +1238,20 @@ class MaliAPIMailbox(BaseMailbox):
                         continue
 
                     code = self._safe_extract(search_text, code_pattern)
+                    if code and code in exclude_codes:
+                        continue
                     if code:
-                        self._log(f"[MaliAPI] 收到验证码: {code}")
+                        self._log(f"[GPTMail] 收到验证码: {code}")
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class CFWorkerMailbox(BaseMailbox):
@@ -931,6 +1265,8 @@ class CFWorkerMailbox(BaseMailbox):
         domain_override: str = "",
         domains: Any = None,
         enabled_domains: Any = None,
+        subdomain: str = "",
+        random_subdomain: Any = False,
         fingerprint: str = "",
         custom_auth: str = "",
         proxy: str = None,
@@ -946,6 +1282,8 @@ class CFWorkerMailbox(BaseMailbox):
             self.enabled_domains = [d for d in raw_enabled_domains if d in allowed]
         else:
             self.enabled_domains = raw_enabled_domains
+        self.subdomain = self._normalize_subdomain(subdomain)
+        self.random_subdomain = self._to_bool(random_subdomain)
         self.fingerprint = fingerprint
         self.custom_auth = custom_auth
         self.proxy = build_requests_proxy_config(proxy)
@@ -982,8 +1320,8 @@ class CFWorkerMailbox(BaseMailbox):
         method: str,
         path: str,
         *,
-        params: dict | None = None,
-        payload: dict | None = None,
+        params: Optional[dict] = None,
+        payload: Optional[dict] = None,
         timeout: int = 15,
     ):
         import requests
@@ -1032,6 +1370,21 @@ class CFWorkerMailbox(BaseMailbox):
             value = value[1:]
         return value
 
+    @staticmethod
+    def _normalize_subdomain(value: Any) -> str:
+        sub = str(value or "").strip().lower().strip(".")
+        if sub.startswith("@"):
+            sub = sub[1:]
+        parts = [part for part in sub.split(".") if part]
+        return ".".join(parts)
+
+    @staticmethod
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        return text in {"1", "true", "yes", "on"}
+
     @classmethod
     def _parse_domains(cls, value: Any) -> list[str]:
         if not value:
@@ -1074,11 +1427,32 @@ class CFWorkerMailbox(BaseMailbox):
             return random.choice(self.enabled_domains)
         return self.domain
 
+    def _generate_subdomain_label(self, length: int = 6) -> str:
+        import string
+
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.choices(alphabet, k=length))
+
+    def _compose_domain(self, base_domain: str) -> str:
+        domain = self._normalize_domain(base_domain)
+        if not domain:
+            return ""
+
+        sub_parts: list[str] = []
+        if self.random_subdomain:
+            sub_parts.append(self._generate_subdomain_label())
+        if self.subdomain:
+            sub_parts.append(self.subdomain)
+
+        if not sub_parts:
+            return domain
+        return f"{'.'.join(sub_parts)}.{domain}"
+
     def get_email(self) -> MailboxAccount:
         self._ensure_api_configured()
         name = self._generate_local_part()
         payload = {"enablePrefix": True, "name": name}
-        selected_domain = self._pick_domain()
+        selected_domain = self._compose_domain(self._pick_domain())
         if selected_domain:
             payload["domain"] = selected_domain
             self._log(f"[CFWorker] 本次使用域名: {selected_domain}")
@@ -1128,15 +1502,14 @@ class CFWorkerMailbox(BaseMailbox):
         **kwargs,
     ) -> str:
         import re
-        import time
         from datetime import datetime, timezone
 
         seen = set(before_ids or [])
         exclude_codes = set(kwargs.get("exclude_codes") or [])
         otp_sent_at = kwargs.get("otp_sent_at")
         otp_cutoff = float(otp_sent_at) - 2 if otp_sent_at else None
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 mails = self._get_mails(account.email)
                 for mail in sorted(mails, key=lambda x: x.get("id", 0), reverse=True):
@@ -1189,8 +1562,14 @@ class CFWorkerMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"\u7b49\u5f85\u9a8c\u8bc1\u7801\u8d85\u65f6 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+            timeout_message=f"\u7b49\u5f85\u9a8c\u8bc1\u7801\u8d85\u65f6 ({timeout}s)",
+        )
 
 
 class MoeMailMailbox(BaseMailbox):
@@ -1296,12 +1675,11 @@ class MoeMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time
+        import re
 
         seen = set(before_ids or [])
-        start = time.time()
-        pattern = re.compile(code_pattern) if code_pattern else None
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 r = self._session.get(
                     f"{self.api}/api/emails/{account.account_id}", timeout=10
@@ -1331,8 +1709,13 @@ class MoeMailMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
 
 
 class LuckMailMailbox(BaseMailbox):
@@ -1400,6 +1783,15 @@ class LuckMailMailbox(BaseMailbox):
                 self._email = item.email_address
                 return item.token
         return ""
+
+    def _cancel_order_silently(self, order_no: str) -> None:
+        if not order_no:
+            return
+        try:
+            self._client.user.cancel_order(order_no)
+            self._log(f"[LuckMail] 已取消订单: {order_no}")
+        except Exception:
+            pass
 
     def _extract_code_from_token_mails(
         self,
@@ -1525,23 +1917,37 @@ class LuckMailMailbox(BaseMailbox):
             def on_poll_order(result):
                 self._log(f"[LuckMail] 轮询中... 状态: {result.status}")
 
+            deadline = time.monotonic() + max(int(timeout or 0), 1)
+            last_status = "pending"
             try:
-                code_result = self._client.user._sync_wait_for_code(
-                    order_no=order_no,
-                    timeout=timeout,
-                    interval=3.0,
-                    on_poll=on_poll_order,
-                )
-            except Exception as e:
-                raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+                while time.monotonic() < deadline:
+                    self._checkpoint()
+                    remaining = max(1, int(deadline - time.monotonic()))
+                    slice_timeout = min(remaining, 6)
+                    try:
+                        code_result = self._client.user._sync_wait_for_code(
+                            order_no=order_no,
+                            timeout=slice_timeout,
+                            interval=3.0,
+                            on_poll=on_poll_order,
+                        )
+                    except Exception as e:
+                        raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
 
-            if code_result.status == "success" and code_result.verification_code:
-                code = code_result.verification_code
-                self._log(f"[LuckMail] 收到验证码: {code}")
-                return code
+                    last_status = str(code_result.status or "pending")
+                    if code_result.status == "success" and code_result.verification_code:
+                        code = code_result.verification_code
+                        self._log(f"[LuckMail] 收到验证码: {code}")
+                        return code
+                    if code_result.status in {"cancelled", "timeout"}:
+                        break
+            except Exception:
+                self._cancel_order_silently(order_no)
+                raise
 
+            self._cancel_order_silently(order_no)
             raise TimeoutError(
-                f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: {code_result.status}"
+                f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: {last_status}"
             )
 
         token = self._resolve_token(account)
@@ -1552,45 +1958,67 @@ class LuckMailMailbox(BaseMailbox):
         exclude_codes = {
             str(code) for code in (kwargs.get("exclude_codes") or set()) if code
         }
+        seen_message_ids = {str(mid) for mid in (before_ids or set()) if mid}
+        if before_ids is None:
+            seen_message_ids = self.get_current_ids(account)
+            if seen_message_ids:
+                self._log(
+                    f"[LuckMail] 已建立旧邮件基线，先跳过 {len(seen_message_ids)} 封历史邮件"
+                )
 
-        def on_poll(result):
+        saw_new_mail = False
+
+        def poll_once() -> Optional[str]:
+            nonlocal saw_new_mail
+            found_new_mail = False
+            try:
+                mail_list = self._client.user.get_token_mails(token)
+            except Exception as e:
+                raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+
+            for mail in mail_list.mails:
+                message_id = str(mail.message_id or "").strip()
+                if message_id and message_id in seen_message_ids:
+                    continue
+
+                found_new_mail = True
+                saw_new_mail = True
+                if message_id:
+                    seen_message_ids.add(message_id)
+
+                body = " ".join(
+                    [
+                        str(mail.subject or ""),
+                        str(mail.body or ""),
+                        str(mail.html_body or ""),
+                    ]
+                )
+                code = self._safe_extract(body, code_pattern)
+                if code and code in exclude_codes:
+                    self._log(
+                        f"[LuckMail] 跳过已使用验证码 message_id={message_id or '-'} code={code}"
+                    )
+                    continue
+                if code:
+                    self._log(f"[LuckMail] 收到验证码: {code}")
+                    return code
+
             self._log(
-                f"[LuckMail] 轮询中... 新邮件: {'是' if result.has_new_mail else '否'}"
+                f"[LuckMail] 轮询中... 新邮件: {'是' if found_new_mail else '否'}"
             )
 
-        try:
-            code_result = self._client.user.wait_for_token_code(
-                token=token,
-                timeout=timeout,
-                interval=3.0,
-                on_poll=on_poll,
-            )
-        except Exception as e:
-            raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+            if found_new_mail:
+                self._log("[LuckMail] 新邮件还不是可用验证码，继续等下一封...")
+            return None
 
-        code = code_result.verification_code
-        if code and code in exclude_codes:
-            code = None
-        if not code and code_result.mail:
-            parsed_code = self._safe_extract(
-                json.dumps(code_result.mail, ensure_ascii=False), code_pattern
-            )
-            if parsed_code and parsed_code not in exclude_codes:
-                code = parsed_code
-        if not code and (code_result.has_new_mail or before_ids is None):
-            code = self._extract_code_from_token_mails(
-                token,
-                code_pattern,
-                before_ids=before_ids,
-                exclude_codes=exclude_codes,
-            )
-
-        if code:
-            self._log(f"[LuckMail] 收到验证码: {code}")
-            return code
-
-        raise TimeoutError(
-            f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: has_new_mail={code_result.has_new_mail}"
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+            timeout_message=(
+                f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: "
+                f"has_new_mail={saw_new_mail}"
+            ),
         )
 
 
@@ -1665,11 +2093,9 @@ class FreemailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        import re, time
-
         seen = set(before_ids or [])
-        start = time.time()
-        while time.time() - start < timeout:
+
+        def poll_once() -> Optional[str]:
             try:
                 r = self._session.get(
                     f"{self.api}/api/emails",
@@ -1694,5 +2120,10 @@ class FreemailMailbox(BaseMailbox):
                         return code
             except Exception:
                 pass
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
